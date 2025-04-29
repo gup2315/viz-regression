@@ -6,9 +6,12 @@
     "start": "node app.js"
   },
   "dependencies": {
+    "aws-sdk": "^2.1692.0",
     "express": "^5.1.0",
     "p-queue": "^8.1.0",
     "pdfkit": "^0.16.0",
+    "pixelmatch": "^7.1.0",
+    "pngjs": "^7.0.0",
     "promise-queue": "^2.2.5",
     "puppeteer-core": "^24.6.1"
   }

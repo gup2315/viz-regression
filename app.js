@@ -1,16 +1,29 @@
 const express = require("express");
 const puppeteer = require("puppeteer-core");
+const AWS = require("aws-sdk");
 const path = require("path");
 const fs = require("fs");
 const Queue = require("promise-queue");
 const PDFDocument = require("pdfkit");
+const pixelmatch = require("pixelmatch");
+const { PNG } = require("pngjs");
+const crypto = require("crypto");
 
 const queue = new Queue(1, Infinity);
 const app = express();
 const PORT = process.env.PORT || 10000;
 const chromePath = "/usr/bin/google-chrome-stable";
 
-// race page.goto against a manual timeout
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION,
+});
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function safeGoto(page, url, timeout = 60000) {
   return Promise.race([
     page.goto(url, { waitUntil: "domcontentloaded", timeout }),
@@ -18,11 +31,6 @@ async function safeGoto(page, url, timeout = 60000) {
       setTimeout(() => reject(new Error("Manual navigation timeout")), timeout)
     ),
   ]);
-}
-
-// small helper
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 app.get("/capture", (req, res) => {
@@ -34,103 +42,91 @@ async function handleCapture(req, res) {
   try {
     const { url, type } = req.query;
     if (!url) return res.status(400).send("Missing 'url' query parameter.");
-
     const isPDF = type && type.toLowerCase() === "pdf";
+
+    const urlHash = crypto.createHash("md5").update(url).digest("hex");
+    const basePath = `screenshots/${urlHash}`;
+    const timestamp = Date.now();
+    const fileName = `${basePath}/capture-${timestamp}.png`;
+    const baselineKey = `${basePath}/baseline.png`;
+    const diffKey = `${basePath}/diff-${timestamp}.png`;
 
     browser = await puppeteer.launch({
       headless: "new",
       timeout: 60000,
       executablePath: chromePath,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
       protocolTimeout: 60000,
     });
 
     const page = await browser.newPage();
     await page.setUserAgent(
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/117 Safari/537.36"
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36"
     );
     await page.setViewport({ width: 1220, height: 1000 });
 
-    // 1) navigate and wait for the capture container
     await safeGoto(page, url);
     await page.waitForSelector("#capture-full", { timeout: 30000 });
 
-    // selectors scoped to #capture-full
-    const mapSel   = "#capture-full .mapboxgl-canvas";
-    const chartSel = "#capture-full svg.highcharts-root";
-    const imgSel   = "#capture-full img";
-
-    // 2) if it's a map page, wait for canvas + 3 s buffer
-    if (await page.$(mapSel)) {
-      await page.waitForFunction(
-        sel => {
-          const c = document.querySelector(sel);
-          return c && c.width > 0 && c.height > 0;
-        },
-        { timeout: 30000 },
-        mapSel
-      );
-      await delay(3000);
-    }
-    // 3) else if it's a chart page, wait for the SVG to render
-    else if (await page.$(chartSel)) {
-      await page.waitForFunction(
-        sel => {
-          const svg = document.querySelector(sel);
-          return svg && svg.clientWidth > 0 && svg.clientHeight > 0;
-        },
-        { timeout: 30000 },
-        chartSel
-      );
-    }
-    // 4) else if it has images, wait for them to finish loading
-    else if ((await page.$$(imgSel)).length > 0) {
-      await page.waitForFunction(
-        sel => Array.from(document.querySelectorAll(sel))
-                      .every(i => i.complete && i.naturalHeight > 0),
-        { timeout: 30000 },
-        imgSel
-      );
-    }
-    // otherwise we proceed immediately
-
-    // 5) screenshot
+    const pngBuffer = await page.$eval("#capture-full", async (el) => {
+      const box = el.getBoundingClientRect();
+      return await el.ownerDocument.defaultView.devicePixelRatio;
+    });
     const elementHandle = await page.$("#capture-full");
     const box = await elementHandle.boundingBox();
     if (!box) throw new Error("Could not determine bounding box");
+    const screenshot = await elementHandle.screenshot({ type: "png" });
 
-    const pngBuffer = await elementHandle.screenshot({ type: "png" });
+    await browser.close();
 
-    // 6) send back PDF or PNG
-    if (isPDF) {
-      const doc = new PDFDocument({ autoFirstPage: false });
-      const buffers = [];
-      doc.on("data", buffers.push.bind(buffers));
-      doc.on("end", async () => {
-        const pdfBuffer = Buffer.concat(buffers);
-        await browser.close();
-        res.set({
-          "Content-Type": "application/pdf",
-          "Content-Length": pdfBuffer.length,
-        });
-        res.send(pdfBuffer);
+    await s3.putObject({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: fileName,
+      Body: screenshot,
+      ContentType: "image/png",
+    }).promise();
+
+    let baselineBuffer;
+    try {
+      const baseline = await s3.getObject({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: baselineKey,
+      }).promise();
+      baselineBuffer = baseline.Body;
+    } catch (err) {
+      await s3.putObject({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: baselineKey,
+        Body: screenshot,
+        ContentType: "image/png",
+      }).promise();
+      return res.json({
+        message: "Baseline created.",
+        url: `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${baselineKey}`,
       });
-      doc.addPage({ size: [Math.ceil(box.width), Math.ceil(box.height)] });
-      doc.image(pngBuffer, 0, 0, { width: box.width, height: box.height });
-      doc.end();
-    } else {
-      await browser.close();
-      res.set({
-        "Content-Type": "image/png",
-        "Content-Length": pngBuffer.length,
-      });
-      res.send(pngBuffer);
     }
+
+    const img1 = PNG.sync.read(baselineBuffer);
+    const img2 = PNG.sync.read(screenshot);
+    const { width, height } = img1;
+    const diff = new PNG({ width, height });
+
+    const numDiffPixels = pixelmatch(img1.data, img2.data, diff.data, width, height, {
+      threshold: 0.1,
+    });
+
+    const diffBuffer = PNG.sync.write(diff);
+    await s3.putObject({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: diffKey,
+      Body: diffBuffer,
+      ContentType: "image/png",
+    }).promise();
+
+    res.json({
+      message: `Diff complete with ${numDiffPixels} pixels changed`,
+      diff_url: `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${diffKey}`,
+    });
   } catch (err) {
     console.error("Capture error:", err);
     if (browser) await browser.close();
