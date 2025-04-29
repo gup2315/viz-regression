@@ -1,28 +1,31 @@
 import express from "express";
 import puppeteer from "puppeteer";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Queue from "promise-queue";
+import PDFDocument from "pdfkit";
 import { PNG } from "pngjs";
 import crypto from "crypto";
 
-const app   = express();
 const queue = new Queue(1, Infinity);
-const PORT  = process.env.PORT || 10000;
+const app = express();
+const PORT = process.env.PORT || 10000;
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION,
   credentials: {
-    accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
 
+// helper to turn a ReadableStream into a Buffer
 function streamToBuffer(stream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    stream.on("data",    c => chunks.push(c));
-    stream.on("end",     () => resolve(Buffer.concat(chunks)));
-    stream.on("error",  reject);
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
   });
 }
 
@@ -37,86 +40,91 @@ async function handleCapture(req, res) {
     const { url } = req.query;
     if (!url) return res.status(400).send("Missing 'url' query parameter.");
 
-    // build keys
-    const hash       = crypto.createHash("md5").update(url).digest("hex");
-    const basePath   = `screenshots/${hash}`;
-    const ts         = Date.now();
-    const captureKey = `${basePath}/capture-${ts}.png`;
-    const baselineKey= `${basePath}/baseline.png`;
-    const diffKey    = `${basePath}/diff-${ts}.png`;
+    // create deterministic keys
+    const hash = crypto.createHash("md5").update(url).digest("hex");
+    const base = `screenshots/${hash}`;
+    const now = Date.now();
+    const captureKey  = `${base}/capture-${now}.png`;
+    const baselineKey = `${base}/baseline.png`;
+    const diffKey     = `${base}/diff-${now}.png`;
 
-    // launch and snapshot
+    // launch and snap
     browser = await puppeteer.launch({
       headless: "new",
       args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"],
-      timeout: 60000,
     });
     const page = await browser.newPage();
-    await page.setViewport({ width: 1220, height: 1000 });
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
-    await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 });
-
-    const el         = await page.$(".mtc-eyebrow");
-    const screenshot = await el.screenshot({ type: "png" });
+    await page.setViewport({ width:1220, height:1000 });
+    await page.goto(url, { waitUntil:"networkidle2" });
+    await page.waitForSelector(".mtc-eyebrow", { timeout:60000 });
+    const el = await page.$(".mtc-eyebrow");
+    const screenshot = await el.screenshot({ type:"png" });
     await browser.close();
 
-    // upload new capture
+    // upload capture
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
-      Key:    captureKey,
-      Body:   screenshot,
-      ContentType: "image/png",
+      Key: captureKey,
+      Body: screenshot,
+      ContentType: "image/png"
     }));
 
-    // attempt to fetch existing baseline
+    // fetch or create baseline
     let baselineBuffer;
     try {
-      const { Body } = await s3.send(new GetObjectCommand({
+      const got = await s3.send(new GetObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
-        Key:    baselineKey,
+        Key: baselineKey
       }));
-      baselineBuffer = await streamToBuffer(Body);
+      baselineBuffer = await streamToBuffer(got.Body);
     } catch {
-      // no baseline yet → save this one
+      // first run: store this as baseline
       await s3.send(new PutObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
-        Key:    baselineKey,
-        Body:   screenshot,
-        ContentType: "image/png",
+        Key: baselineKey,
+        Body: screenshot,
+        ContentType: "image/png"
       }));
-      return res.json({
-        message:      "Baseline created.",
-        baseline_url: `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${baselineKey}`,
-      });
+      // return a signed URL for the baseline
+      const url = await getSignedUrl(s3,
+        new GetObjectCommand({
+          Bucket: process.env.S3_BUCKET_NAME,
+          Key: baselineKey
+        }),
+        { expiresIn: 60 * 60 } // 1 hour
+      );
+      return res.json({ message:"Baseline created.", baseline_url:url });
     }
 
-    // compute diff
+    // diff
     const img1 = PNG.sync.read(baselineBuffer);
     const img2 = PNG.sync.read(screenshot);
-    const { width, height } = img1;
-    const diffImage = new PNG({ width, height });
+    const diff = new PNG({ width:img1.width, height:img1.height });
     const numDiff = pixelmatch(
-      img1.data, img2.data, diffImage.data, width, height,
-      { threshold: 0.1 }
+      img1.data, img2.data, diff.data,
+      img1.width, img1.height,
+      { threshold:0.1 }
     );
-    const diffBuffer = PNG.sync.write(diffImage);
+    const diffBuffer = PNG.sync.write(diff);
 
-    // upload diff
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
-      Key:    diffKey,
-      Body:   diffBuffer,
-      ContentType: "image/png",
+      Key: diffKey,
+      Body: diffBuffer,
+      ContentType:"image/png"
     }));
 
-    // return all three public URLs
+    // generate signed URLs (good for 1 hour each)
+    const captureUrl  = await getSignedUrl(s3, new GetObjectCommand({ Bucket:process.env.S3_BUCKET_NAME, Key:captureKey }), { expiresIn:3600 });
+    const diffUrl     = await getSignedUrl(s3, new GetObjectCommand({ Bucket:process.env.S3_BUCKET_NAME, Key:diffKey    }), { expiresIn:3600 });
+
     res.json({
-      message:      `Diff complete with ${numDiff} pixels changed.`,
-      capture_url:  `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${captureKey}`,
-      baseline_url: `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${baselineKey}`,
-      diff_url:     `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${diffKey}`,
+      message:       `Diff complete: ${numDiff} pixels changed.`,
+      capture_url:   captureUrl,
+      diff_url:      diffUrl
     });
-  } catch (err) {
+  }
+  catch (err) {
     console.error("Capture error:", err);
     if (browser) await browser.close();
     res.status(500).send("Error capturing the requested content.");
