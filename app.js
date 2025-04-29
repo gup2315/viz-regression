@@ -46,14 +46,20 @@ async function handleCapture(req, res) {
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1900, height: 1000 });
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 90000 });
 
-    // Fallback logic: try `.mtc-eyebrow`, or fallback to `main` element if not found
+    // Give heavy JS sites extra time to fully load
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
+
+    // Ensure page animations/rendering is settled
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+
+    // Try to wait for the element with fallback
     let handle;
     try {
-      await page.waitForSelector(".mtc-eyebrow", { timeout: 15000 });
+      await page.waitForSelector(".mtc-eyebrow", { timeout: 30000 });
       handle = await page.$(".mtc-eyebrow");
     } catch {
+      console.warn("Falling back to <main> selector...");
       await page.waitForSelector("main", { timeout: 15000 });
       handle = await page.$("main");
     }
@@ -128,7 +134,7 @@ async function handleCapture(req, res) {
       diff_url: diffUrl,
     });
   } catch (err) {
-    console.error(err);
+    console.error("Capture Error:", err);
     if (browser) await browser.close();
     res.status(500).send("Capture Error");
   }
