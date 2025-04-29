@@ -54,7 +54,6 @@ async function handleCapture(req, res) {
 
     browser = await puppeteer.launch({
       headless: "new",
-      executablePath: chromePath,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
       timeout: 60000,
       protocolTimeout: 60000,
