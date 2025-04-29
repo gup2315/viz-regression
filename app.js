@@ -66,9 +66,9 @@ async function handleCapture(req, res) {
     await page.setViewport({ width: 1220, height: 1000 });
 
     await safeGoto(page, url);
-    await page.waitForSelector("#__next", { timeout: 30000 });
+    await page.waitForSelector("#mtc-eyebrow", { timeout: 30000 });
 
-    const elementHandle = await page.$("#__next");
+    const elementHandle = await page.$("#mtc-eyebrow");
     const box = await elementHandle.boundingBox();
     if (!box) throw new Error("Could not determine bounding box");
     const screenshot = await elementHandle.screenshot({ type: "png" });
