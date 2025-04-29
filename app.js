@@ -65,8 +65,8 @@ async function handleCapture(req, res) {
     );
     await page.setViewport({ width: 1220, height: 1000 });
 
-    await safeGoto(page, url);
-    await page.waitForSelector(".mtc-eyebrow", { timeout: 30000 });
+    await page.goto(url, { waitUntil: "networkidle2" }); // important: wait for network calm
+    await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 }); // allow longer time
 
     const elementHandle = await page.$(".mtc-eyebrow");
     const box = await elementHandle.boundingBox();
