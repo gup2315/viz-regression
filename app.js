@@ -5,7 +5,6 @@ const path = require("path");
 const fs = require("fs");
 const Queue = require("promise-queue");
 const PDFDocument = require("pdfkit");
-const pixelmatch = require("pixelmatch");
 const { PNG } = require("pngjs");
 const crypto = require("crypto");
 
@@ -40,6 +39,8 @@ app.get("/capture", (req, res) => {
 async function handleCapture(req, res) {
   let browser;
   try {
+    const { default: pixelmatch } = await import("pixelmatch");
+
     const { url, type } = req.query;
     if (!url) return res.status(400).send("Missing 'url' query parameter.");
     const isPDF = type && type.toLowerCase() === "pdf";
@@ -68,10 +69,6 @@ async function handleCapture(req, res) {
     await safeGoto(page, url);
     await page.waitForSelector("#capture-full", { timeout: 30000 });
 
-    const pngBuffer = await page.$eval("#capture-full", async (el) => {
-      const box = el.getBoundingClientRect();
-      return await el.ownerDocument.defaultView.devicePixelRatio;
-    });
     const elementHandle = await page.$("#capture-full");
     const box = await elementHandle.boundingBox();
     if (!box) throw new Error("Could not determine bounding box");
