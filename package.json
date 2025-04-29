@@ -14,6 +14,6 @@
     "pixelmatch": "^7.1.0",
     "pngjs": "^7.0.0",
     "promise-queue": "^2.2.5",
-    "puppeteer": "^21.3.8"
+    "puppeteer": "^22.8.2"
   }
 }
