@@ -1,13 +1,17 @@
-const express = require("express");
-const puppeteer = require("puppeteer-core");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
-const path = require("path");
-const fs = require("fs");
-const Queue = require("promise-queue");
-const PDFDocument = require("pdfkit");
-const { PNG } = require("pngjs");
-const crypto = require("crypto");
-const { default: pixelmatch } = await import("pixelmatch");
+import express from "express";
+import puppeteer from "puppeteer-core";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import path from "path";
+import fs from "fs";
+import Queue from "promise-queue";
+import PDFDocument from "pdfkit";
+import { PNG } from "pngjs";
+import crypto from "crypto";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url); // for legacy require if needed
 
 const queue = new Queue(1, Infinity);
 const app = express();
@@ -42,6 +46,8 @@ app.get("/capture", (req, res) => {
 async function handleCapture(req, res) {
   let browser;
   try {
+    const { default: pixelmatch } = await import("pixelmatch");
+
     const { url, type } = req.query;
     if (!url) return res.status(400).send("Missing 'url' query parameter.");
     const isPDF = type && type.toLowerCase() === "pdf";
@@ -74,32 +80,35 @@ async function handleCapture(req, res) {
     const box = await elementHandle.boundingBox();
     if (!box) throw new Error("Could not determine bounding box");
     const screenshot = await elementHandle.screenshot({ type: "png" });
-
     await browser.close();
 
-    // Upload captured screenshot
-    await s3.send(new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME,
-      Key: fileName,
-      Body: screenshot,
-      ContentType: "image/png",
-    }));
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: fileName,
+        Body: screenshot,
+        ContentType: "image/png",
+      })
+    );
 
     let baselineBuffer;
     try {
-      const baseline = await s3.send(new GetObjectCommand({
-        Bucket: process.env.S3_BUCKET_NAME,
-        Key: baselineKey,
-      }));
+      const baseline = await s3.send(
+        new GetObjectCommand({
+          Bucket: process.env.S3_BUCKET_NAME,
+          Key: baselineKey,
+        })
+      );
       baselineBuffer = await streamToBuffer(baseline.Body);
     } catch (err) {
-      // No baseline exists yet, create it
-      await s3.send(new PutObjectCommand({
-        Bucket: process.env.S3_BUCKET_NAME,
-        Key: baselineKey,
-        Body: screenshot,
-        ContentType: "image/png",
-      }));
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: process.env.S3_BUCKET_NAME,
+          Key: baselineKey,
+          Body: screenshot,
+          ContentType: "image/png",
+        })
+      );
       return res.json({
         message: "Baseline created.",
         url: `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${baselineKey}`,
@@ -116,12 +125,15 @@ async function handleCapture(req, res) {
     });
 
     const diffBuffer = PNG.sync.write(diff);
-    await s3.send(new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME,
-      Key: diffKey,
-      Body: diffBuffer,
-      ContentType: "image/png",
-    }));
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: diffKey,
+        Body: diffBuffer,
+        ContentType: "image/png",
+      })
+    );
 
     res.json({
       message: `Diff complete with ${numDiffPixels} pixels changed`,
@@ -134,16 +146,15 @@ async function handleCapture(req, res) {
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`Puppeteer capture service running on port ${PORT}`);
-});
-
-// Helper function: stream → buffer (needed because GetObject returns a stream in v3)
 function streamToBuffer(stream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("error", reject);
     stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
   });
 }
+
+app.listen(PORT, () => {
+  console.log(`Puppeteer capture service running on port ${PORT}`);
+});
