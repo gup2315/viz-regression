@@ -1,17 +1,10 @@
 import express from "express";
-import puppeteer from "puppeteer-core";
+import puppeteer from "puppeteer";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import path from "path";
-import fs from "fs";
 import Queue from "promise-queue";
 import PDFDocument from "pdfkit";
 import { PNG } from "pngjs";
 import crypto from "crypto";
-import { fileURLToPath } from "url";
-import { dirname } from "path";
-import { createRequire } from "module";
-
-const require = createRequire(import.meta.url); // for legacy require if needed
 
 const queue = new Queue(1, Infinity);
 const app = express();
@@ -61,9 +54,9 @@ async function handleCapture(req, res) {
 
     browser = await puppeteer.launch({
       headless: "new",
-      timeout: 60000,
       executablePath: chromePath,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      timeout: 60000,
       protocolTimeout: 60000,
     });
 
@@ -80,6 +73,7 @@ async function handleCapture(req, res) {
     const box = await elementHandle.boundingBox();
     if (!box) throw new Error("Could not determine bounding box");
     const screenshot = await elementHandle.screenshot({ type: "png" });
+
     await browser.close();
 
     await s3.send(
