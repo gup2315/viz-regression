@@ -1,22 +1,25 @@
 const express = require("express");
 const puppeteer = require("puppeteer-core");
-const AWS = require("aws-sdk");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const path = require("path");
 const fs = require("fs");
 const Queue = require("promise-queue");
 const PDFDocument = require("pdfkit");
 const { PNG } = require("pngjs");
 const crypto = require("crypto");
+const { default: pixelmatch } = await import("pixelmatch");
 
 const queue = new Queue(1, Infinity);
 const app = express();
 const PORT = process.env.PORT || 10000;
 const chromePath = "/usr/bin/google-chrome-stable";
 
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+const s3 = new S3Client({
   region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
 });
 
 function delay(ms) {
@@ -39,8 +42,6 @@ app.get("/capture", (req, res) => {
 async function handleCapture(req, res) {
   let browser;
   try {
-    const { default: pixelmatch } = await import("pixelmatch");
-
     const { url, type } = req.query;
     if (!url) return res.status(400).send("Missing 'url' query parameter.");
     const isPDF = type && type.toLowerCase() === "pdf";
@@ -76,27 +77,29 @@ async function handleCapture(req, res) {
 
     await browser.close();
 
-    await s3.putObject({
+    // Upload captured screenshot
+    await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: fileName,
       Body: screenshot,
       ContentType: "image/png",
-    }).promise();
+    }));
 
     let baselineBuffer;
     try {
-      const baseline = await s3.getObject({
+      const baseline = await s3.send(new GetObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
-      }).promise();
-      baselineBuffer = baseline.Body;
+      }));
+      baselineBuffer = await streamToBuffer(baseline.Body);
     } catch (err) {
-      await s3.putObject({
+      // No baseline exists yet, create it
+      await s3.send(new PutObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
         Body: screenshot,
         ContentType: "image/png",
-      }).promise();
+      }));
       return res.json({
         message: "Baseline created.",
         url: `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${baselineKey}`,
@@ -113,12 +116,12 @@ async function handleCapture(req, res) {
     });
 
     const diffBuffer = PNG.sync.write(diff);
-    await s3.putObject({
+    await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: diffKey,
       Body: diffBuffer,
       ContentType: "image/png",
-    }).promise();
+    }));
 
     res.json({
       message: `Diff complete with ${numDiffPixels} pixels changed`,
@@ -134,3 +137,13 @@ async function handleCapture(req, res) {
 app.listen(PORT, () => {
   console.log(`Puppeteer capture service running on port ${PORT}`);
 });
+
+// Helper function: stream → buffer (needed because GetObject returns a stream in v3)
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}

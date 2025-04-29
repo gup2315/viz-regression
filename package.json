@@ -5,8 +5,9 @@
   "scripts": {
     "start": "node app.js"
   },
+  "type": "module",
   "dependencies": {
-    "aws-sdk": "^2.1692.0",
+    "@aws-sdk/client-s3": "^3.500.0",
     "express": "^5.1.0",
     "p-queue": "^8.1.0",
     "pdfkit": "^0.16.0",
