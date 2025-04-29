@@ -9,13 +9,12 @@ import crypto from "crypto";
 const app = express();
 const queue = new Queue(1, Infinity);
 const PORT = process.env.PORT || 10000;
-
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 
 function streamToBuffer(stream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    stream.on("data", (c) => chunks.push(c));
+    stream.on("data", (chunk) => chunks.push(chunk));
     stream.on("end", () => resolve(Buffer.concat(chunks)));
     stream.on("error", reject);
   });
@@ -45,60 +44,56 @@ async function handleCapture(req, res) {
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1900, height: 1000 });
-
-    // Give heavy JS sites extra time to fully load
+    await page.setViewport({ width: 1920, height: 1080 });
     await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
 
-    // Ensure page animations/rendering is settled
-    await page.evaluate(() => new Promise(requestAnimationFrame));
-
-    // Try to wait for the element with fallback
+    // Try `.mtc-eyebrow` up to 60s, fallback to `<main>` if not found
     let handle;
     try {
-      await page.waitForSelector(".mtc-eyebrow", { timeout: 30000 });
+      await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 });
       handle = await page.$(".mtc-eyebrow");
     } catch {
-      console.warn("Falling back to <main> selector...");
+      console.warn("Fallback to <main>");
       await page.waitForSelector("main", { timeout: 15000 });
       handle = await page.$("main");
     }
 
-    if (!handle) throw new Error("Could not find any suitable capture element");
-    const png = await handle.screenshot({ type: "png" });
+    if (!handle) throw new Error("Capture element not found");
+
+    const screenshot = await handle.screenshot({ type: "png" });
     await browser.close();
 
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: rawKey,
-      Body: png,
+      Body: screenshot,
       ContentType: "image/png",
     }));
 
-    let baselineBuf;
+    let baselineBuffer;
     try {
-      const existing = await s3.send(new GetObjectCommand({
+      const baseline = await s3.send(new GetObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
       }));
-      baselineBuf = await streamToBuffer(existing.Body);
+      baselineBuffer = await streamToBuffer(baseline.Body);
     } catch {
       await s3.send(new PutObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
-        Body: png,
+        Body: screenshot,
         ContentType: "image/png",
       }));
-      const signedBaseline = await getSignedUrl(
+      const baselineUrl = await getSignedUrl(
         s3,
         new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }),
         { expiresIn: 3600 }
       );
-      return res.json({ message: "Baseline created", baseline_url: signedBaseline });
+      return res.json({ message: "Baseline created", baseline_url: baselineUrl });
     }
 
-    const img1 = PNG.sync.read(baselineBuf);
-    const img2 = PNG.sync.read(png);
+    const img1 = PNG.sync.read(baselineBuffer);
+    const img2 = PNG.sync.read(screenshot);
     const { width, height } = img1;
     const diff = new PNG({ width, height });
     const numDiff = pixelmatch(img1.data, img2.data, diff.data, width, height, { threshold: 0.1 });
@@ -111,21 +106,11 @@ async function handleCapture(req, res) {
       ContentType: "image/png",
     }));
 
-    const captureUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: rawKey }),
-      { expiresIn: 3600 }
-    );
-    const baselineUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }),
-      { expiresIn: 3600 }
-    );
-    const diffUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: diffKey }),
-      { expiresIn: 3600 }
-    );
+    const [captureUrl, baselineUrl, diffUrl] = await Promise.all([
+      getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: rawKey }), { expiresIn: 3600 }),
+      getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }), { expiresIn: 3600 }),
+      getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: diffKey }), { expiresIn: 3600 }),
+    ]);
 
     res.json({
       message: `Diff complete: ${numDiff} pixels changed`,
