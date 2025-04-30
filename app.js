@@ -13,6 +13,8 @@ import crypto from "crypto";
 const app = express();
 const queue = new Queue(1, Infinity);
 const PORT = process.env.PORT || 10000;
+const chromePath = "/usr/bin/google-chrome-stable";
+
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 
 // helper to collect stream into a Buffer
@@ -25,6 +27,16 @@ function streamToBuffer(stream) {
   });
 }
 
+// safeGoto: race page.goto against a manual reject after `timeout` ms
+async function safeGoto(page, url, timeout = 60000) {
+  return Promise.race([
+    page.goto(url, { waitUntil: "domcontentloaded", timeout }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Manual navigation timeout")), timeout)
+    ),
+  ]);
+}
+
 app.get("/capture", (req, res) => {
   queue.add(() => handleCapture(req, res));
 });
@@ -34,9 +46,7 @@ async function handleCapture(req, res) {
   try {
     const { default: pixelmatch } = await import("pixelmatch");
     const { url, ignore } = req.query;
-    if (!url) {
-      return res.status(400).send("Missing url parameter");
-    }
+    if (!url) return res.status(400).send("Missing url parameter");
 
     // parse ignore regions
     let ignoreRegions = [];
@@ -58,58 +68,48 @@ async function handleCapture(req, res) {
 
     browser = await puppeteer.launch({
       headless: "new",
+      executablePath: chromePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
       ],
-      protocolTimeout: 180000, // 3 min CDP timeout
+      protocolTimeout: 60000, // 1 min CDP timeout
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
-    page.setDefaultNavigationTimeout(180000);
-    page.setDefaultTimeout(180000);
+    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultTimeout(60000);
 
-    // try navigation but do not bail on timeout
+    // navigate with our safe timeout
     try {
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
+      await safeGoto(page, url, 60000);
     } catch (err) {
-      console.warn(`Navigation timeout after 180 s, proceeding: ${err.message}`);
+      console.warn(`Navigation warning: ${err.message}`);
     }
 
-    // give dynamic content some time
-    console.log("Waiting 2 minutes for dynamic content…");
-    await new Promise((r) => setTimeout(r, 120000));
-
-    // attempt to grab the element
+    // wait for your target element (or fallback)
     let handle = null;
-
     try {
-      await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 });
+      await page.waitForSelector(".mtc-eyebrow", { timeout: 30000 });
       handle = await page.$(".mtc-eyebrow");
     } catch {
       console.warn(".mtc-eyebrow not found, trying <main>…");
-    }
-
-    if (!handle) {
       try {
         await page.waitForSelector("main", { timeout: 15000 });
         handle = await page.$("main");
       } catch {
-        console.warn("main not found, falling back to full-page capture");
+        console.warn("main not found, falling back to full-page");
       }
     }
 
-    // take screenshot (element or full page)
-    let screenshot;
-    if (handle) {
-      screenshot = await handle.screenshot({ type: "png", timeout: 0 });
-    } else {
-      screenshot = await page.screenshot({ type: "png", fullPage: true, timeout: 0 });
-    }
+    // take screenshot (selector or full page)
+    const screenshot = handle
+      ? await handle.screenshot({ type: "png", timeout: 0 })
+      : await page.screenshot({ type: "png", fullPage: true, timeout: 0 });
 
-    // upload raw capture
+    // upload raw
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: rawKey,
@@ -117,7 +117,7 @@ async function handleCapture(req, res) {
       ContentType: "image/png",
     }));
 
-    // load or create baseline
+    // load or init baseline
     let baselineBuffer;
     try {
       const baselineObj = await s3.send(new GetObjectCommand({
@@ -126,7 +126,6 @@ async function handleCapture(req, res) {
       }));
       baselineBuffer = await streamToBuffer(baselineObj.Body);
     } catch {
-      // no baseline → create it
       await s3.send(new PutObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
@@ -164,7 +163,6 @@ async function handleCapture(req, res) {
     );
     const diffBuf = PNG.sync.write(diff);
 
-    // upload diff
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: diffKey,
@@ -173,7 +171,7 @@ async function handleCapture(req, res) {
     }));
 
     // signed URLs
-    const [captureUrl, baselineUrl, diffUrl] = await Promise.all([
+    const [capture_url, baseline_url, diff_url] = await Promise.all([
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: rawKey }),      { expiresIn: 3600 }),
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }), { expiresIn: 3600 }),
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: diffKey }),     { expiresIn: 3600 }),
@@ -181,9 +179,9 @@ async function handleCapture(req, res) {
 
     res.json({
       message: `Diff complete: ${numDiff} pixels changed`,
-      capture_url:  captureUrl,
-      baseline_url: baselineUrl,
-      diff_url:     diffUrl,
+      capture_url,
+      baseline_url,
+      diff_url,
     });
 
   } catch (err) {
