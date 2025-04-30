@@ -15,10 +15,11 @@ const queue = new Queue(1, Infinity);
 const PORT = process.env.PORT || 10000;
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 
+// helper to collect stream into a Buffer
 function streamToBuffer(stream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("data", (c) => chunks.push(c));
     stream.on("end", () => resolve(Buffer.concat(chunks)));
     stream.on("error", reject);
   });
@@ -33,9 +34,11 @@ async function handleCapture(req, res) {
   try {
     const { default: pixelmatch } = await import("pixelmatch");
     const { url, ignore } = req.query;
-    if (!url) return res.status(400).send("Missing url parameter");
+    if (!url) {
+      return res.status(400).send("Missing url parameter");
+    }
 
-    // parse ignore regions
+    // parse any ignore regions
     let ignoreRegions = [];
     if (ignore) {
       try {
@@ -60,45 +63,50 @@ async function handleCapture(req, res) {
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
       ],
-      protocolTimeout: 180000, // 3 minutes CDP timeout
+      protocolTimeout: 180000, // 3 min CDP timeout
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
-
-    // extend navigation & selector timeouts
+    // extend navigation & general timeouts
     page.setDefaultNavigationTimeout(180000);
     page.setDefaultTimeout(180000);
 
-    await page.goto(url, {
-      waitUntil: "networkidle2",
-      timeout: 180000,
-    });
+    // try to navigate, but don’t fail if it times out
+    try {
+      await page.goto(url, {
+        waitUntil: "networkidle2",
+        timeout: 180000,
+      });
+    } catch (err) {
+      console.warn(`⚠️ Navigation timeout after 180 s, proceeding: ${err.message}`);
+    }
 
-    // locate target element
+    // wait for your target element (fallback to <main>)
     let handle;
     try {
       await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 });
       handle = await page.$(".mtc-eyebrow");
     } catch {
-      console.warn("Fallback to <main>");
+      console.warn("….mtc-eyebrow not found, falling back to <main>");
       await page.waitForSelector("main", { timeout: 15000 });
       handle = await page.$("main");
     }
-    if (!handle) throw new Error("Capture element not found");
+    if (!handle) {
+      throw new Error("No element found to capture");
+    }
 
-    // extra render time
+    // extra render time for dynamic content
     console.log("Waiting 2 minutes for dynamic content…");
     await new Promise((r) => setTimeout(r, 120000));
 
-    // grab screenshot
+    // take the screenshot of that handle
     const screenshot = await handle.screenshot({
       type: "png",
-      timeout: 0, // disable screenshot timeout
+      timeout: 0,       // disable per-screenshot timeout
     });
-    await browser.close();
 
-    // upload raw
+    // upload the raw capture
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: rawKey,
@@ -106,7 +114,7 @@ async function handleCapture(req, res) {
       ContentType: "image/png",
     }));
 
-    // load or create baseline
+    // attempt to load existing baseline
     let baselineBuffer;
     try {
       const baselineObj = await s3.send(new GetObjectCommand({
@@ -115,7 +123,7 @@ async function handleCapture(req, res) {
       }));
       baselineBuffer = await streamToBuffer(baselineObj.Body);
     } catch {
-      // no baseline → create it
+      // no baseline found → create it and return
       await s3.send(new PutObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
@@ -130,16 +138,16 @@ async function handleCapture(req, res) {
       return res.json({ message: "Baseline created", baseline_url: baselineUrl });
     }
 
-    // read PNGs
+    // diff logic
     const img1 = PNG.sync.read(baselineBuffer);
     const img2 = PNG.sync.read(screenshot);
 
-    // apply ignore regions by equalizing pixels
+    // apply ignore regions
     ignoreRegions.forEach(({ x, y, width: w, height: h }) => {
       for (let yy = y; yy < y + h; yy++) {
         for (let xx = x; xx < x + w; xx++) {
           const idx = (yy * img1.width + xx) * 4;
-          img1.data[idx]     = img2.data[idx];
+          img1.data[idx + 0] = img2.data[idx + 0];
           img1.data[idx + 1] = img2.data[idx + 1];
           img1.data[idx + 2] = img2.data[idx + 2];
           img1.data[idx + 3] = img2.data[idx + 3];
@@ -147,19 +155,15 @@ async function handleCapture(req, res) {
       }
     });
 
-    // diff
     const diff = new PNG({ width: img1.width, height: img1.height });
     const numDiff = pixelmatch(
-      img1.data,
-      img2.data,
-      diff.data,
-      img1.width,
-      img1.height,
+      img1.data, img2.data, diff.data,
+      img1.width, img1.height,
       { threshold: 0.1 }
     );
     const diffBuf = PNG.sync.write(diff);
 
-    // upload diff
+    // upload the diff
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: diffKey,
@@ -167,7 +171,7 @@ async function handleCapture(req, res) {
       ContentType: "image/png",
     }));
 
-    // signed URLs back to client
+    // generate signed URLs
     const [captureUrl, baselineUrl, diffUrl] = await Promise.all([
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: rawKey }),      { expiresIn: 3600 }),
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }), { expiresIn: 3600 }),
@@ -182,9 +186,13 @@ async function handleCapture(req, res) {
     });
 
   } catch (err) {
-    console.error("Capture Error:", err);
-    if (browser) await browser.close();
+    console.error("❌ Capture Error:", err);
     res.status(500).send("Capture Error");
+  } finally {
+    if (browser) {
+      try { await browser.close(); }
+      catch (e) { console.warn("Error closing browser:", e); }
+    }
   }
 }
 
