@@ -38,7 +38,7 @@ async function handleCapture(req, res) {
       return res.status(400).send("Missing url parameter");
     }
 
-    // parse any ignore regions
+    // parse ignore regions
     let ignoreRegions = [];
     if (ignore) {
       try {
@@ -68,45 +68,48 @@ async function handleCapture(req, res) {
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
-    // extend navigation & general timeouts
     page.setDefaultNavigationTimeout(180000);
     page.setDefaultTimeout(180000);
 
-    // try to navigate, but don’t fail if it times out
+    // try navigation but do not bail on timeout
     try {
-      await page.goto(url, {
-        waitUntil: "networkidle2",
-        timeout: 180000,
-      });
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
     } catch (err) {
-      console.warn(`⚠️ Navigation timeout after 180 s, proceeding: ${err.message}`);
+      console.warn(`Navigation timeout after 180 s, proceeding: ${err.message}`);
     }
 
-    // wait for your target element (fallback to <main>)
-    let handle;
+    // give dynamic content some time
+    console.log("Waiting 2 minutes for dynamic content…");
+    await new Promise((r) => setTimeout(r, 120000));
+
+    // attempt to grab the element
+    let handle = null;
+
     try {
       await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 });
       handle = await page.$(".mtc-eyebrow");
     } catch {
-      console.warn("….mtc-eyebrow not found, falling back to <main>");
-      await page.waitForSelector("main", { timeout: 15000 });
-      handle = await page.$("main");
+      console.warn(".mtc-eyebrow not found, trying <main>…");
     }
+
     if (!handle) {
-      throw new Error("No element found to capture");
+      try {
+        await page.waitForSelector("main", { timeout: 15000 });
+        handle = await page.$("main");
+      } catch {
+        console.warn("main not found, falling back to full-page capture");
+      }
     }
 
-    // extra render time for dynamic content
-    console.log("Waiting 2 minutes for dynamic content…");
-    await new Promise((r) => setTimeout(r, 30000));
+    // take screenshot (element or full page)
+    let screenshot;
+    if (handle) {
+      screenshot = await handle.screenshot({ type: "png", timeout: 0 });
+    } else {
+      screenshot = await page.screenshot({ type: "png", fullPage: true, timeout: 0 });
+    }
 
-    // take the screenshot of that handle
-    const screenshot = await handle.screenshot({
-      type: "png",
-      timeout: 0,       // disable per-screenshot timeout
-    });
-
-    // upload the raw capture
+    // upload raw capture
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: rawKey,
@@ -114,7 +117,7 @@ async function handleCapture(req, res) {
       ContentType: "image/png",
     }));
 
-    // attempt to load existing baseline
+    // load or create baseline
     let baselineBuffer;
     try {
       const baselineObj = await s3.send(new GetObjectCommand({
@@ -123,7 +126,7 @@ async function handleCapture(req, res) {
       }));
       baselineBuffer = await streamToBuffer(baselineObj.Body);
     } catch {
-      // no baseline found → create it and return
+      // no baseline → create it
       await s3.send(new PutObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
         Key: baselineKey,
@@ -138,11 +141,9 @@ async function handleCapture(req, res) {
       return res.json({ message: "Baseline created", baseline_url: baselineUrl });
     }
 
-    // diff logic
+    // diff
     const img1 = PNG.sync.read(baselineBuffer);
     const img2 = PNG.sync.read(screenshot);
-
-    // apply ignore regions
     ignoreRegions.forEach(({ x, y, width: w, height: h }) => {
       for (let yy = y; yy < y + h; yy++) {
         for (let xx = x; xx < x + w; xx++) {
@@ -163,7 +164,7 @@ async function handleCapture(req, res) {
     );
     const diffBuf = PNG.sync.write(diff);
 
-    // upload the diff
+    // upload diff
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: diffKey,
@@ -171,7 +172,7 @@ async function handleCapture(req, res) {
       ContentType: "image/png",
     }));
 
-    // generate signed URLs
+    // signed URLs
     const [captureUrl, baselineUrl, diffUrl] = await Promise.all([
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: rawKey }),      { expiresIn: 3600 }),
       getSignedUrl(s3, new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }), { expiresIn: 3600 }),
@@ -186,7 +187,7 @@ async function handleCapture(req, res) {
     });
 
   } catch (err) {
-    console.error("❌ Capture Error:", err);
+    console.error("Capture Error:", err);
     res.status(500).send("Capture Error");
   } finally {
     if (browser) {
