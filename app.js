@@ -98,7 +98,7 @@ async function handleCapture(req, res) {
 
     // extra render time for dynamic content
     console.log("Waiting 2 minutes for dynamic content…");
-    await new Promise((r) => setTimeout(r, 120000));
+    await new Promise((r) => setTimeout(r, 30000));
 
     // take the screenshot of that handle
     const screenshot = await handle.screenshot({
