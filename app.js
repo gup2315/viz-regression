@@ -13,6 +13,7 @@ import crypto from "crypto";
 const app = express();
 const queue = new Queue(1, Infinity);
 const PORT = process.env.PORT || 10000;
+
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 
 function streamToBuffer(stream) {
@@ -22,6 +23,21 @@ function streamToBuffer(stream) {
     stream.on("end", () => resolve(Buffer.concat(chunks)));
     stream.on("error", reject);
   });
+}
+
+async function retryGoto(page, url, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      });
+      return;
+    } catch (e) {
+      console.warn(`Retry ${i + 1} for ${url}`);
+      if (i === attempts - 1) throw e;
+    }
+  }
 }
 
 app.get("/capture", (req, res) => {
@@ -53,54 +69,39 @@ async function handleCapture(req, res) {
     const diffKey = `${base}/diff-${now}.png`;
 
     browser = await puppeteer.launch({
-      headless: "new",
+      headless: true,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
       ],
-      protocolTimeout: 180000,
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
-    page.setDefaultNavigationTimeout(180000);
-    page.setDefaultTimeout(180000);
-
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
       "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     );
 
     console.log(`[NAVIGATE] ${url}`);
-    await page.goto(url, {
-      waitUntil: "networkidle2",
-      timeout: 180000,
-    });
+    await retryGoto(page, url);
 
-    let handle;
-    try {
-      await page.waitForSelector(".mtc-eyebrow", { timeout: 60000 });
-      handle = await page.$(".mtc-eyebrow");
-    } catch {
-      console.warn("Fallback to .main-content");
-      handle = await page.$(".main-content");
-
-      if (!handle) {
-        console.warn("Fallback to <body>");
-        handle = await page.$("body");
-      }
-    }
+    let handle = await page.$(".mtc-eyebrow")
+      || await page.$(".main-content")
+      || await page.$("body");
 
     if (!handle) throw new Error("Capture element not found");
 
-    console.log("Waiting up to 120s for charts to render…");
+    console.log("Waiting for charts to render...");
     await Promise.race([
       page.waitForSelector(".mtc-eyebrow svg, .mtc-eyebrow canvas", { timeout: 20000 }),
       new Promise((resolve) => setTimeout(resolve, 120000)),
     ]);
 
-    const screenshot = await handle.screenshot({ type: "png", timeout: 0 });
+    const screenshot = await handle.screenshot({ type: "png" });
     await browser.close();
 
     await s3.send(new PutObjectCommand({
@@ -124,8 +125,7 @@ async function handleCapture(req, res) {
         Body: screenshot,
         ContentType: "image/png",
       }));
-      const baselineUrl = await getSignedUrl(
-        s3,
+      const baselineUrl = await getSignedUrl(s3,
         new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: baselineKey }),
         { expiresIn: 3600 }
       );
@@ -139,7 +139,7 @@ async function handleCapture(req, res) {
       for (let yy = y; yy < y + h; yy++) {
         for (let xx = x; xx < x + w; xx++) {
           const idx = (yy * img1.width + xx) * 4;
-          img1.data[idx]     = img2.data[idx];
+          img1.data[idx] = img2.data[idx];
           img1.data[idx + 1] = img2.data[idx + 1];
           img1.data[idx + 2] = img2.data[idx + 2];
           img1.data[idx + 3] = img2.data[idx + 3];
@@ -156,8 +156,8 @@ async function handleCapture(req, res) {
       img1.height,
       { threshold: 0.1 }
     );
-    const diffBuf = PNG.sync.write(diff);
 
+    const diffBuf = PNG.sync.write(diff);
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: diffKey,
